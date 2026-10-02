@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gopcua/opcua"
+	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/server"
 	"github.com/gopcua/opcua/ua"
+	"github.com/gopcua/opcua/uasc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,7 +32,7 @@ var testNodes = []struct {
 
 // startTestServer retries on a fresh port because server.New fixes the
 // listen address from its first endpoint, and Start has no setter to change it.
-func startTestServer(t *testing.T) (string, []*ua.NodeID) {
+func startTestServer(t *testing.T, configure ...func(*server.Server)) (string, []*ua.NodeID) {
 	t.Helper()
 
 	const attempts = 5
@@ -49,6 +52,11 @@ func startTestServer(t *testing.T) (string, []*ua.NodeID) {
 		nodeIDs := make([]*ua.NodeID, 0, len(testNodes))
 		for _, n := range testNodes {
 			nodeIDs = append(nodeIDs, ns.AddNewVariableStringNode(n.name, n.value).ID())
+		}
+
+		// Optional wire faults are installed before the default handlers initialize.
+		for _, setup := range configure {
+			setup(s)
 		}
 
 		if err := s.Start(context.Background()); err != nil {
@@ -133,6 +141,101 @@ func wantValues(nodeIDs []*ua.NodeID, n int) map[string][]int32 {
 		want[nodeIDs[i].String()] = []int32{testNodes[i].value}
 	}
 	return want
+}
+
+// TestMalformedMonitorWireResponseRecovers exercises real service replies, retry and teardown.
+func TestMalformedMonitorWireResponseRecovers(t *testing.T) {
+	// None of these request-level failures may retain local handles or poison SDK locks.
+	for _, fault := range []string{"short", "long", "rejected"} {
+		t.Run(fault, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			var attempts atomic.Uint32
+			var srv *server.Server
+			endpoint, nodes := startTestServer(t, func(s *server.Server) {
+				srv = s
+				s.RegisterHandler(id.CreateMonitoredItemsRequest_Encoding_DefaultBinary,
+					func(sc *uasc.SecureChannel, request ua.Request, reqID uint32) (ua.Response, error) {
+						// The first three requests fail without allocating any server monitors.
+						if attempts.Add(1) <= 3 {
+							r := request.(*ua.CreateMonitoredItemsRequest)
+							res := &ua.CreateMonitoredItemsResponse{ResponseHeader: &ua.ResponseHeader{
+								RequestHandle: r.RequestHeader.RequestHandle, Timestamp: time.Now(),
+								ServiceDiagnostics: &ua.DiagnosticInfo{}, AdditionalHeader: ua.NewExtensionObject(nil),
+							}}
+
+							// Shape faults are successful service responses with invalid cardinality.
+							switch fault {
+							case "short":
+								res.Results = []*ua.MonitoredItemCreateResult{{MonitoredItemID: 100}}
+							case "long":
+								res.Results = []*ua.MonitoredItemCreateResult{{MonitoredItemID: 100}, {MonitoredItemID: 101}, {MonitoredItemID: 102}}
+							case "rejected":
+								res.Results = []*ua.MonitoredItemCreateResult{{StatusCode: ua.StatusBadNodeIDUnknown}, {StatusCode: ua.StatusBadNodeIDUnknown}}
+							}
+							return res, nil
+						}
+						return s.MonitoredItemService.CreateMonitoredItems(sc, request, reqID)
+					})
+			})
+			c, err := opcua.NewClient(endpoint, opcua.SecurityMode(ua.MessageSecurityModeNone))
+			require.NoError(t, err)
+			require.NoError(t, c.Connect(ctx))
+			closed := false
+			t.Cleanup(func() {
+				// Keep failure cleanup bounded without cancelling the server before the client.
+				if !closed {
+					cleanupCtx, stop := context.WithTimeout(context.Background(), time.Second)
+					defer stop()
+					require.NoError(t, c.Close(cleanupCtx))
+				}
+			})
+			m, err := NewNodeMonitor(c)
+			require.NoError(t, err)
+			ch := make(chan *DataChangeMessage, 16)
+
+			// Initial creation failure must delete the otherwise unreachable subscription.
+			initial, err := m.ChanSubscribe(ctx, &opcua.SubscriptionParameters{Interval: 50 * time.Millisecond}, ch,
+				nodes[0].String(), nodes[1].String())
+			require.Error(t, err)
+			require.Nil(t, initial)
+			srv.SubscriptionService.Mu.Lock()
+			remaining := len(srv.SubscriptionService.Subs)
+			srv.SubscriptionService.Mu.Unlock()
+			require.Zero(t, remaining, "failed creation must release the server subscription")
+			sub, err := m.ChanSubscribe(ctx, &opcua.SubscriptionParameters{Interval: 50 * time.Millisecond}, ch)
+			require.NoError(t, err)
+			unsubscribed := false
+			t.Cleanup(func() {
+				// A failed assertion must still release the registered server subscription.
+				if !unsubscribed {
+					cleanupCtx, stop := context.WithTimeout(context.Background(), time.Second)
+					defer stop()
+					require.NoError(t, sub.Unsubscribe(cleanupCtx))
+				}
+			})
+
+			// Repeated malformed replies must not accumulate handles.
+			for range 2 {
+				require.Error(t, sub.AddNodeIDs(ctx, nodes[:2]...))
+				require.Zero(t, sub.Subscribed())
+				require.Empty(t, sub.itemLookup)
+			}
+
+			// A healthy retry uses the same subscription, including real value delivery.
+			require.NoError(t, sub.AddNodeIDs(ctx, nodes[:2]...))
+			require.Equal(t, 2, sub.Subscribed())
+			require.Equal(t, wantValues(nodes, 2), valuesByNodeID(t, ch, 2))
+			require.NoError(t, sub.RemoveNodeIDs(ctx, nodes[:2]...))
+			require.Zero(t, sub.Subscribed())
+			require.NoError(t, sub.AddNodeIDs(ctx, nodes[2]))
+			require.Equal(t, 1, sub.Subscribed())
+			require.NoError(t, sub.Unsubscribe(ctx))
+			unsubscribed = true
+			require.NoError(t, c.Close(ctx))
+			closed = true
+		})
+	}
 }
 
 // TestBatchedAddMonitorItemsNotifiesEachNode verifies that each node's value

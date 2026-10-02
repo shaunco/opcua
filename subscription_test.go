@@ -3,6 +3,7 @@ package opcua
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gopcua/opcua/ua"
 	"github.com/stretchr/testify/require"
@@ -153,6 +154,96 @@ func newSubscriptionWithItems(stub *stubClient, nodes ...*ua.NodeID) *Subscripti
 		}
 	}
 	return sub
+}
+
+// TestMonitorMalformedResponseKeepsSubscriptionUsable validates before any item-map mutation.
+func TestMonitorMalformedResponseKeepsSubscriptionUsable(t *testing.T) {
+	tests := []struct {
+		name string
+		res  *ua.CreateMonitoredItemsResponse
+	}{
+		{"nil-response", nil},
+		{"nil-header", &ua.CreateMonitoredItemsResponse{}},
+		{"short", &ua.CreateMonitoredItemsResponse{ResponseHeader: &ua.ResponseHeader{}, Results: []*ua.MonitoredItemCreateResult{{MonitoredItemID: 100}}}},
+		{"long", &ua.CreateMonitoredItemsResponse{ResponseHeader: &ua.ResponseHeader{}, Results: []*ua.MonitoredItemCreateResult{{}, {}, {}}}},
+		{"nil-entry", &ua.CreateMonitoredItemsResponse{ResponseHeader: &ua.ResponseHeader{}, Results: []*ua.MonitoredItemCreateResult{{MonitoredItemID: 100}, nil}}},
+		{"bad-service", &ua.CreateMonitoredItemsResponse{ResponseHeader: &ua.ResponseHeader{ServiceResult: ua.StatusBadUnexpectedError}}},
+	}
+
+	// Each malformed response must leave an existing healthy monitor untouched.
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			stub := &stubClient{send: func(_ ua.Request, h func(ua.Response) error) error { return h(tc.res) }}
+			sub := newSubscriptionWithItems(stub, ua.NewNumericNodeID(1, 1))
+			requests := []*ua.MonitoredItemCreateRequest{
+				NewMonitoredItemCreateRequestWithDefaults(ua.NewNumericNodeID(1, 2), ua.AttributeIDValue, 2),
+				NewMonitoredItemCreateRequestWithDefaults(ua.NewNumericNodeID(1, 3), ua.AttributeIDValue, 3),
+			}
+			res, err := sub.Monitor(ctx, ua.TimestampsToReturnBoth, requests...)
+			require.Error(t, err)
+			require.Nil(t, res)
+			require.Len(t, sub.items, 1)
+			require.Contains(t, sub.items, uint32(1))
+			require.True(t, sub.itemsMu.TryLock(), "malformed results must not poison itemsMu")
+			sub.itemsMu.Unlock()
+
+			// Retry, removal and cancellation must finish even after malformed success responses.
+			done := make(chan error, 1)
+			go func() {
+				stub.send = func(req ua.Request, h func(ua.Response) error) error {
+					// Supply realistic successful service responses for the recovery sequence.
+					switch req.(type) {
+					case *ua.CreateMonitoredItemsRequest:
+						return monitoredItemsResponder(nil)(req, h)
+					case *ua.DeleteMonitoredItemsRequest:
+						return h(&ua.DeleteMonitoredItemsResponse{ResponseHeader: &ua.ResponseHeader{}, Results: []ua.StatusCode{ua.StatusOK, ua.StatusOK}})
+					case *ua.DeleteSubscriptionsRequest:
+						return h(&ua.DeleteSubscriptionsResponse{ResponseHeader: &ua.ResponseHeader{}, Results: []ua.StatusCode{ua.StatusOK}})
+					default:
+						return ua.StatusBadServiceUnsupported
+					}
+				}
+				_, err := sub.Monitor(ctx, ua.TimestampsToReturnBoth, requests...)
+
+				// Stop at the original error rather than returning success-shaped fallback.
+				if err == nil {
+					_, err = sub.Unmonitor(ctx, 100, 101)
+				}
+
+				// Cancellation clears the preserved original item and server subscription.
+				if err == nil {
+					err = sub.Cancel(ctx)
+				}
+				done <- err
+			}()
+
+			// Bound the regression so a poisoned mutex reports a failure instead of hanging the suite.
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+				require.Empty(t, sub.items)
+			case <-ctx.Done():
+				t.Fatal("Monitor/Unmonitor/Cancel did not finish after malformed response")
+			}
+		})
+	}
+}
+
+// TestMonitorRetainsOnlySuccessfulOperations preserves per-item rejection semantics.
+func TestMonitorRetainsOnlySuccessfulOperations(t *testing.T) {
+	gone, alive := ua.NewStringNodeID(1, "gone"), ua.NewStringNodeID(1, "alive")
+	stub := &stubClient{send: monitoredItemsResponder(map[string]ua.StatusCode{gone.String(): ua.StatusBadNodeIDUnknown})}
+	sub := newSubscriptionWithItems(stub)
+	res, err := sub.Monitor(context.Background(), ua.TimestampsToReturnBoth,
+		NewMonitoredItemCreateRequestWithDefaults(gone, ua.AttributeIDValue, 1),
+		NewMonitoredItemCreateRequestWithDefaults(alive, ua.AttributeIDValue, 2))
+	require.NoError(t, err)
+	require.Len(t, res.Results, 2)
+	require.Equal(t, ua.StatusBadNodeIDUnknown, res.Results[0].StatusCode)
+	require.Len(t, sub.items, 1)
+	require.Equal(t, alive, sub.items[100].req.ItemToMonitor.NodeID)
 }
 
 // TestRecreateMonitoredItems covers #886.

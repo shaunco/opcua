@@ -160,7 +160,10 @@ func newSubscription(ctx context.Context, m *NodeMonitor, params *opcua.Subscrip
 	}
 
 	if err = s.AddNodes(ctx, nodes...); err != nil {
-		return nil, err
+		// Failed initial monitors must not leave an unreachable server/client subscription.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.client.RequestTimeout())
+		defer cancel()
+		return nil, errors.Join(err, s.Unsubscribe(cleanupCtx))
 	}
 
 	return s, nil
@@ -337,6 +340,7 @@ func (s *Subscription) AddNodeIDs(ctx context.Context, nodes ...*ua.NodeID) erro
 
 // AddMonitorItems adds monitored nodes. Any ClientHandle set in a Request is
 // ignored; the subscription assigns its own. See Part 4, 7.21.
+// Request failures release all new handles; operation failures retain successful items.
 func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([]Item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -349,6 +353,18 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 
 	toAdd := make([]*ua.MonitoredItemCreateRequest, 0)
 	allocated := make([]uint32, len(nodes))
+	committed := false
+
+	// Request/service/shape failures must not leak notification handles on retries.
+	defer func() {
+		// Only a fully validated response can commit successful handles.
+		if !committed {
+			// Preserve all handles that predate this request.
+			for _, handle := range allocated {
+				delete(s.handles, handle)
+			}
+		}
+	}()
 
 	// Add handles and make requests
 	for i, node := range nodes {
@@ -358,6 +374,8 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 
 		toAdd = append(toAdd, buildCreateRequest(node, handle))
 	}
+
+	// The low-level Monitor validates response shape before updating its item map.
 	resp, err := s.sub.Monitor(ctx, ua.TimestampsToReturnBoth, toAdd...)
 	if err != nil {
 		return nil, err
@@ -390,6 +408,9 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 		s.itemLookup[res.MonitoredItemID] = mn
 		monitoredItems = append(monitoredItems, mn)
 	}
+
+	// Partial operation failures retain successful items; their failed handles are already removed.
+	committed = true
 
 	if len(failedItems) > 0 {
 		// monitoredItems is nil when every item failed and non-nil when some

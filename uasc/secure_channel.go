@@ -986,6 +986,7 @@ func (s *SecureChannel) SendRequestWithTimeout(ctx context.Context, req ua.Reque
 	return s.sendRequestWithTimeout(ctx, req, s.nextRequestID(), active, authToken, timeout, h)
 }
 
+// sendAsyncWithTimeout writes a request and retains its handler only after a complete send.
 func (s *SecureChannel) sendAsyncWithTimeout(
 	ctx context.Context,
 	req ua.Request,
@@ -995,6 +996,12 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	respRequired bool,
 	timeout time.Duration,
 ) (<-chan *MessageBody, error) {
+	// Bail out early if the caller context is already cancelled to avoid
+	// registering handlers or touching the network when we know the call
+	// should not proceed.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	instance.Lock()
 	defer instance.Unlock()
@@ -1021,17 +1028,40 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 		s.handlersMu.Unlock()
 	}
 
-	chunks, err := m.EncodeChunks(instance.maxBodySize)
-	if err != nil {
+	// Only the owner that removes the handler may close its buffered channel.
+	cleanupHandler := func() {
+		// Response-free requests never registered a channel.
+		if !respRequired {
+			return
+		}
+
+		// popHandler transfers ownership atomically against the receive dispatcher.
+		if ch, ok := s.popHandler(reqID); ok {
+			close(ch)
+		}
+	}
+
+	// If the context was cancelled after registration, remove the handler and
+	// return without putting a partial request on the wire.
+	if err := ctx.Err(); err != nil {
+		cleanupHandler()
 		return nil, err
 	}
 
+	chunks, err := m.EncodeChunks(instance.maxBodySize)
+	if err != nil {
+		cleanupHandler()
+		return nil, err
+	}
+
+	// Each chunk keeps the service timeout, capped by the absolute caller deadline.
 	for i, chunk := range chunks {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		// Cancellation between chunks must also remove the response handler.
+		if err := ctx.Err(); err != nil {
+			cleanupHandler()
+			return nil, err
 		}
+
 		if i > 0 { // fix sequence number on subsequent chunks
 			number := instance.nextSequenceNumber()
 			binary.LittleEndian.PutUint32(chunk[16:], uint32(number))
@@ -1039,16 +1069,44 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 
 		chunk, err = instance.signAndEncrypt(m, chunk)
 		if err != nil {
+			cleanupHandler()
 			return nil, err
 		}
 
-		// send the message
-		var n int
-		s.c.SetWriteDeadline(time.Now().Add(timeout))
-		if n, err = s.c.Write(chunk); err != nil {
+		// Signing/encoding time must not extend the caller's deadline.
+		deadline := time.Now().Add(timeout)
+		if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+			deadline = callerDeadline
+		}
+
+		// Check deadline setup rather than silently attempting an unbounded write.
+		if err := s.c.SetWriteDeadline(deadline); err != nil {
+			cleanupHandler()
 			return nil, err
 		}
-		s.c.SetWriteDeadline(time.Time{})
+
+		// Always clear the write deadline, including on a failed chunk send.
+		var n int
+		n, err = s.c.Write(chunk)
+		clearErr := s.c.SetWriteDeadline(time.Time{})
+
+		// Preserve the write failure if resetting the deadline also fails.
+		if err != nil {
+			cleanupHandler()
+			return nil, err
+		}
+
+		// A failed reset must not leave a stale deadline silently attached to the connection.
+		if clearErr != nil {
+			cleanupHandler()
+			return nil, clearErr
+		}
+
+		// A partial chunk is a failed request, not a successfully registered response wait.
+		if n != len(chunk) {
+			cleanupHandler()
+			return nil, io.ErrShortWrite
+		}
 
 		atomic.AddUint64(&instance.bytesSent, uint64(n))
 		atomic.AddUint32(&instance.messagesSent, 1)

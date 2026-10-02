@@ -145,6 +145,7 @@ func (s *Subscription) ModifySubscription(ctx context.Context, params Subscripti
 	return res, nil
 }
 
+// Monitor creates monitored items and retains only successful, structurally valid results.
 func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, items ...*ua.MonitoredItemCreateRequest) (*ua.CreateMonitoredItemsResponse, error) {
 	stats.Subscription().Add("Monitor", 1)
 	stats.Subscription().Add("MonitoredItems", int64(len(items)))
@@ -161,23 +162,53 @@ func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, it
 		return safeAssign(v, &res)
 	})
 
+	// A failed request provides no usable item results.
 	if err != nil {
 		return nil, err
 	}
 
-	// store monitored items
+	// Validate the complete response before locking or mutating reconnect state.
+	if res == nil || res.ResponseHeader == nil {
+		return nil, errors.New("monitor returned no response header")
+	}
+
+	// Service failures are not operation-level results.
+	if res.ResponseHeader.ServiceResult != ua.StatusOK {
+		return nil, res.ResponseHeader.ServiceResult
+	}
+
+	// Part 4 requires one result in request order for each requested item.
+	if len(res.Results) != len(items) {
+		return nil, errors.Errorf("monitor returned %d results for %d items", len(res.Results), len(items))
+	}
+
+	// Reject nil entries before an earlier valid entry can change the item map.
+	for i, result := range res.Results {
+		// A nil result cannot provide status or a server-assigned item identity.
+		if result == nil {
+			return nil, errors.Errorf("monitor returned nil result at index %d", i)
+		}
+	}
+
+	// Retain the lock only for publishing the validated successful item records.
 	s.itemsMu.Lock()
+	defer s.itemsMu.Unlock()
+
+	// Rejected operations must not be replayed as accepted monitors on reconnect.
 	for i, item := range items {
 		result := res.Results[i]
+
+		// A failed operation has no usable server-assigned monitored item ID.
+		if result.StatusCode != ua.StatusOK {
+			continue
+		}
 		s.items[result.MonitoredItemID] = &monitoredItem{
 			req: item,
 			res: result,
 			ts:  ts,
 		}
 	}
-	s.itemsMu.Unlock()
-
-	return res, err
+	return res, nil
 }
 
 func (s *Subscription) Unmonitor(ctx context.Context, monitoredItemIDs ...uint32) (*ua.DeleteMonitoredItemsResponse, error) {

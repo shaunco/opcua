@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -703,6 +704,152 @@ func TestNewSecureChannel(t *testing.T) {
 		_, err := NewSecureChannel("", &uacp.Conn{}, cfg, make(chan error))
 		require.ErrorContains(t, err, "invalid channel config: Security policy 'http://opcfoundation.org/UA/SecurityPolicy#Basic256' requires a private key")
 	})
+}
+
+// requestEncodingHook injects a request-body encoder failure after handler registration.
+type requestEncodingHook struct {
+	encode func() ([]byte, error)
+}
+
+// Encode exercises the ordinary ExtensionObject binary-encoder boundary.
+func (h *requestEncodingHook) Encode() ([]byte, error) { return h.encode() }
+
+// newTestRequestChannel creates a real connected transport without a receive dispatcher.
+func newTestRequestChannel(t *testing.T) (*SecureChannel, *channelInstance, *net.TCPConn) {
+	t.Helper()
+	sender, peer := newTestTCPConnPair(t)
+	t.Cleanup(func() { sender.Close(); peer.Close() })
+	c, err := uacp.NewConn(sender, nil)
+	require.NoError(t, err)
+	s := &SecureChannel{
+		c: c, handlers: make(map[uint32]chan *MessageBody),
+		cfg: &Config{SecurityMode: ua.MessageSecurityModeNone, SecurityPolicyURI: ua.SecurityPolicyURINone, RequestTimeout: time.Second},
+	}
+	instance := newChannelInstance(s)
+	instance.state = channelActive
+	instance.maxBodySize = 1024
+	return s, instance, peer
+}
+
+// TestSendAsyncFailureRemovesHandler covers failures before any successful request send.
+func TestSendAsyncFailureRemovesHandler(t *testing.T) {
+	// Context and encoding failures occur on both sides of handler registration.
+	for _, fault := range []string{"already-cancelled", "header-cancelled", "encode-error", "encode-cancelled", "closed-transport"} {
+		t.Run(fault, func(t *testing.T) {
+			s, instance, peer := newTestRequestChannel(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var request ua.Request = &ua.ReadRequest{}
+
+			// Inject only the boundary being checked, leaving the real framing path intact.
+			switch fault {
+			case "already-cancelled":
+				cancel()
+			case "header-cancelled":
+				s.time = func() time.Time { cancel(); return time.Now() }
+			case "encode-error", "encode-cancelled":
+				request = &ua.HistoryReadRequest{HistoryReadDetails: &ua.ExtensionObject{
+					TypeID: ua.NewTwoByteExpandedNodeID(1), EncodingMask: ua.ExtensionObjectBinary,
+					Value: &requestEncodingHook{encode: func() ([]byte, error) {
+						// A body encoder runs after the response handler has been installed.
+						if fault == "encode-cancelled" {
+							cancel()
+							return []byte{0}, nil
+						}
+						return nil, ua.StatusBadEncodingError
+					}},
+				}}
+			case "closed-transport":
+				require.NoError(t, s.c.Close())
+			}
+			response, err := s.sendAsyncWithTimeout(ctx, request, 42, instance, nil, true, time.Second)
+			require.Error(t, err)
+			require.Nil(t, response)
+			require.Empty(t, s.handlers)
+
+			// A cancelled/invalid request must not leave any bytes on the peer.
+			if fault != "closed-transport" {
+				require.NoError(t, peer.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+				var one [1]byte
+				n, err := peer.Read(one[:])
+				require.Zero(t, n)
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+// TestSendAsyncCallerDeadlineBoundsAllChunks checks a slow real TCP peer, not a deadline proxy.
+func TestSendAsyncCallerDeadlineBoundsAllChunks(t *testing.T) {
+	s, instance, peer := newTestRequestChannel(t)
+	require.NoError(t, s.c.SetWriteBuffer(1024))
+	require.NoError(t, peer.SetReadBuffer(1024))
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	readerCtx, stopReader := context.WithCancel(context.Background())
+	defer stopReader()
+	var chunks atomic.Uint32
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+
+		// Slow per-chunk consumption forces the sender past its socket buffer.
+		for {
+			var header [8]byte
+
+			// Connection close during cleanup unblocks a pending read.
+			if _, err := io.ReadFull(peer, header[:]); err != nil {
+				return
+			}
+			size := binary.LittleEndian.Uint32(header[4:])
+
+			// Reject invalid framing rather than allocating an unbounded test buffer.
+			if size < 8 || size > 4096 {
+				return
+			}
+
+			// Count only whole chunks received from the actual transport.
+			if _, err := io.CopyN(io.Discard, peer, int64(size-8)); err != nil {
+				return
+			}
+			chunks.Add(1)
+
+			// This delay makes per-chunk deadline extensions observable.
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-readerCtx.Done():
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		stopReader()
+		peer.Close()
+		<-readerDone
+	})
+	request := &ua.WriteRequest{NodesToWrite: []*ua.WriteValue{{
+		NodeID: ua.NewNumericNodeID(1, 1), AttributeID: ua.AttributeIDValue,
+		Value: &ua.DataValue{EncodingMask: ua.DataValueValue, Value: ua.MustVariant(make([]byte, 512*1024))},
+	}}}
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := s.sendAsyncWithTimeout(ctx, request, 42, instance, nil, true, 2*time.Second)
+		done <- err
+	}()
+
+	// Bound lock/write regressions even if the implementation ignores the caller context.
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		require.Less(t, time.Since(start), time.Second)
+	case <-time.After(time.Second):
+		s.c.Close()
+		<-done
+		t.Fatal("multi-chunk request extended the caller deadline")
+	}
+	require.Empty(t, s.handlers)
+	require.Greater(t, chunks.Load(), uint32(1))
 }
 
 const chunkedResponseTestTimeout = 2 * time.Second
