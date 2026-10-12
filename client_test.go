@@ -2,6 +2,7 @@ package opcua
 
 import (
 	"context"
+	"io"
 	"testing"
 
 	"github.com/gopcua/opcua/id"
@@ -100,6 +101,97 @@ func TestCloneReadRequest(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := cloneReadRequest(tt.req)
 			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestUpdateReadResponseStatus(t *testing.T) {
+	decode := func(wire []byte, wantErr error) *ua.Variant {
+		t.Helper()
+		var eo ua.ExtensionObject
+		_, err := eo.Decode(wire)
+		if wantErr != nil {
+			require.ErrorIs(t, err, wantErr)
+			require.Nil(t, eo.Value)
+			require.Nil(t, eo.RawBody)
+		} else {
+			require.NoError(t, err)
+		}
+		return ua.MustVariant(&eo)
+	}
+	known := ua.NewExtensionObject(&ua.AnonymousIdentityToken{PolicyID: "anonymous"})
+	knownWire, err := known.Encode()
+	require.NoError(t, err)
+	xml := ua.XMLElement("<vendor/>")
+	xmlWire, err := ua.NewExtensionObject(&xml).Encode()
+	require.NoError(t, err)
+
+	cases := []struct {
+		name    string
+		value   *ua.Variant
+		unknown bool
+	}{
+		{
+			name:  "retained-binary",
+			value: decode([]byte{1, 2, 0x60, 0xea, 1, 2, 0, 0, 0, 0xab, 0xcd}, nil),
+		},
+		{
+			name:  "retained-empty-binary",
+			value: decode([]byte{1, 2, 0x60, 0xea, 1, 0, 0, 0, 0}, nil),
+		},
+		{
+			name:    "null-binary-body",
+			value:   decode([]byte{1, 2, 0x60, 0xea, 1, 0xff, 0xff, 0xff, 0xff}, nil),
+			unknown: true,
+		},
+		{
+			name:    "empty-object",
+			value:   decode([]byte{0, 0, 0}, nil),
+			unknown: true,
+		},
+		{
+			name:    "truncated-binary-body",
+			value:   decode([]byte{1, 2, 0x60, 0xea, 1, 2, 0, 0, 0, 0xab}, io.ErrUnexpectedEOF),
+			unknown: true,
+		},
+		{
+			name: "unavailable-binary",
+			value: ua.MustVariant(&ua.ExtensionObject{
+				TypeID:       ua.NewFourByteExpandedNodeID(2, 60000),
+				EncodingMask: ua.ExtensionObjectBinary,
+			}),
+			unknown: true,
+		},
+		{
+			name: "raw-body-not-binary",
+			value: ua.MustVariant(&ua.ExtensionObject{
+				TypeID:       ua.NewFourByteExpandedNodeID(2, 60000),
+				EncodingMask: ua.ExtensionObjectXML,
+				RawBody:      []byte{},
+			}),
+			unknown: true,
+		},
+		{name: "known-structure", value: decode(knownWire, nil)},
+		{name: "xml", value: decode(xmlWire, nil)},
+		{name: "scalar", value: ua.MustVariant(uint32(7))},
+		{name: "null-variant", value: ua.MustVariant(nil)},
+		{name: "nil-variant"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, status := range []ua.StatusCode{ua.StatusOK, ua.StatusUncertain, ua.StatusBadNotReadable} {
+				t.Run(status.Error(), func(t *testing.T) {
+					dv := &ua.DataValue{Value: tc.value, Status: status}
+					res := &ua.ReadResponse{Results: []*ua.DataValue{dv}}
+					updateReadResponseStatus(res)
+					want := status
+					if tc.unknown {
+						want = ua.StatusBadDataTypeIDUnknown
+					}
+					require.Equal(t, want, dv.Status)
+					require.Same(t, tc.value, dv.Value)
+				})
+			}
 		})
 	}
 }

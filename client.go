@@ -1093,23 +1093,25 @@ func (c *Client) Read(ctx context.Context, req *ua.ReadRequest) (*ua.ReadRespons
 			return err
 		}
 
-		// If the client cannot decode an extension object then its
-		// value will be nil. However, since the EO was known to the
-		// server the StatusCode for that data value will be OK. We
-		// therefore check for extension objects with nil values and set
-		// the status code to StatusBadDataTypeIDUnknown.
-		for _, dv := range res.Results {
-			if dv.Value == nil {
-				continue
-			}
-			val := dv.Value.Value()
-			if eo, ok := val.(*ua.ExtensionObject); ok && eo.Value == nil {
-				dv.Status = ua.StatusBadDataTypeIDUnknown
-			}
-		}
+		updateReadResponseStatus(res)
 		return nil
 	})
 	return res, err
+}
+
+func updateReadResponseStatus(res *ua.ReadResponse) {
+	// Preserve the server status when a decoded value or retained binary body
+	// is available; otherwise keep the legacy unknown-data-type status.
+	for _, dv := range res.Results {
+		if dv.Value == nil {
+			continue
+		}
+		val := dv.Value.Value()
+		if eo, ok := val.(*ua.ExtensionObject); ok && eo.Value == nil &&
+			!(eo.EncodingMask == ua.ExtensionObjectBinary && eo.RawBody != nil) {
+			dv.Status = ua.StatusBadDataTypeIDUnknown
+		}
+	}
 }
 
 // Write executes a synchronous write request.

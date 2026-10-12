@@ -36,6 +36,10 @@ type ExtensionObject struct {
 	EncodingMask uint8
 	TypeID       *ExpandedNodeID
 	Value        interface{}
+	// RawBody owns the binary body of an unregistered type, leaving Value nil.
+	// Nil means unavailable; a nonnil empty slice means an empty body.
+	// Encode prefers Value when it is populated.
+	RawBody []byte
 }
 
 func NewExtensionObject(value interface{}) *ExtensionObject {
@@ -48,6 +52,8 @@ func NewExtensionObject(value interface{}) *ExtensionObject {
 }
 
 func (e *ExtensionObject) Decode(b []byte) (int, error) {
+	e.Value = nil
+	e.RawBody = nil
 	buf := NewBuffer(b)
 	e.TypeID = new(ExpandedNodeID)
 	buf.ReadStruct(e.TypeID)
@@ -59,6 +65,9 @@ func (e *ExtensionObject) Decode(b []byte) (int, error) {
 
 	length := buf.ReadUint32()
 	if length == 0 || length == 0xffffffff || buf.Error() != nil {
+		if length == 0 && buf.Error() == nil && e.EncodingMask == ExtensionObjectBinary && eotypes.New(e.TypeID.NodeID) == nil {
+			e.RawBody = make([]byte, 0)
+		}
 		return buf.Pos(), buf.Error()
 	}
 
@@ -77,6 +86,9 @@ func (e *ExtensionObject) Decode(b []byte) (int, error) {
 	e.Value = eotypes.New(typeID)
 	if e.Value == nil {
 		debug.Printf("ua: unknown extension object %s", typeID)
+		if e.EncodingMask == ExtensionObjectBinary {
+			e.RawBody = append([]byte(nil), body.Bytes()...)
+		}
 		return buf.Pos(), buf.Error()
 	}
 
@@ -94,6 +106,11 @@ func (e *ExtensionObject) Encode() ([]byte, error) {
 	if e.EncodingMask == ExtensionObjectEmpty {
 		return buf.Bytes(), buf.Error()
 	}
+	if e.EncodingMask == ExtensionObjectBinary && e.Value == nil && e.RawBody != nil {
+		buf.WriteUint32(uint32(len(e.RawBody)))
+		buf.Write(e.RawBody)
+		return buf.Bytes(), buf.Error()
+	}
 
 	body := NewBuffer(nil)
 	body.WriteStruct(e.Value)
@@ -106,7 +123,9 @@ func (e *ExtensionObject) Encode() ([]byte, error) {
 }
 
 func (e *ExtensionObject) UpdateMask() {
-	if e.Value == nil {
+	if e.Value == nil && e.RawBody != nil {
+		e.EncodingMask = ExtensionObjectBinary
+	} else if e.Value == nil {
 		e.EncodingMask = ExtensionObjectEmpty
 	} else if _, ok := e.Value.(*XMLElement); ok {
 		e.EncodingMask = ExtensionObjectXML
