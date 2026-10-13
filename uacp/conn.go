@@ -233,7 +233,10 @@ func (c *Conn) close() error {
 	return c.TCPConn.Close()
 }
 
-func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
+func (c *Conn) Handshake(ctx context.Context, endpoint string) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	hel := &Hello{
 		Version:        c.ack.Version,
 		ReceiveBufSize: c.ack.ReceiveBufSize,
@@ -243,10 +246,33 @@ func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
 		EndpointURL:    endpoint,
 	}
 
-	// set a deadline if there is one
+	// A socket deadline alone cannot interrupt a canceled context with a later deadline.
 	if dl, ok := ctx.Deadline(); ok {
-		c.SetDeadline(dl)
+		if err := c.SetDeadline(dl); err != nil {
+			return err
+		}
 	}
+	canceled := make(chan error, 1)
+	stopCancellation := context.AfterFunc(ctx, func() {
+		canceled <- c.TCPConn.Close()
+	})
+	defer func() {
+		var closeErr error
+		if !stopCancellation() {
+			closeErr = <-canceled
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				err = fmt.Errorf("%w: closing handshake connection: %w", ctxErr, closeErr)
+			} else {
+				err = ctxErr
+			}
+			return
+		}
+		if err == nil {
+			err = c.SetDeadline(time.Time{})
+		}
+	}()
 
 	if err := c.Send("HELF", hel); err != nil {
 		return err
@@ -256,9 +282,6 @@ func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
 	if err != nil {
 		return err
 	}
-
-	// clear the deadline
-	c.SetDeadline(time.Time{})
 
 	msgtyp := string(b[:4])
 	switch msgtyp {

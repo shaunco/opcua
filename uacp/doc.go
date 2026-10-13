@@ -7,6 +7,11 @@
 //
 // To establish the connection as a client, call the Dial() function.
 //
+// The client handshake honors context deadlines and closes the socket when its
+// context is canceled, interrupting blocked I/O even without a deadline.
+// After a successful handshake, cancellation is detached and the handshake
+// deadline is cleared; the caller owns the established connection's lifetime.
+//
 // To wait for the client to connect to, call Listen() method, and to establish
 // connection with the Accept() method.
 //

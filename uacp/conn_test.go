@@ -14,6 +14,124 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func handshakePair(t *testing.T) (*Conn, *Conn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { listener.Close() })
+	clientTCP, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	require.NoError(t, err)
+	t.Cleanup(func() { clientTCP.Close() })
+	serverTCP, err := listener.AcceptTCP()
+	require.NoError(t, err)
+	t.Cleanup(func() { serverTCP.Close() })
+	client, err := NewConn(clientTCP, nil)
+	require.NoError(t, err)
+	server, err := NewConn(serverTCP, nil)
+	require.NoError(t, err)
+	require.NoError(t, server.SetDeadline(time.Now().Add(2*time.Second)))
+	return client, server
+}
+
+func startHandshake(t *testing.T, client *Conn, ctx context.Context) <-chan error {
+	t.Helper()
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		result <- client.Handshake(ctx, "opc.tcp://localhost:4840")
+	}()
+	t.Cleanup(func() {
+		client.TCPConn.Close()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("handshake goroutine did not stop after connection close")
+		}
+	})
+	return result
+}
+
+func TestHandshakeCancellation(t *testing.T) {
+	for _, withDeadline := range []bool{false, true} {
+		name := "without_deadline"
+		if withDeadline {
+			name = "long_deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			client, server := handshakePair(t)
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if withDeadline {
+				ctx, cancel = context.WithTimeout(context.Background(), time.Hour)
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+			}
+			defer cancel()
+			result := startHandshake(t, client, ctx)
+			hello, err := server.Receive()
+			require.NoError(t, err)
+			require.Equal(t, "HELF", string(hello[:4]))
+			cancel()
+			select {
+			case err := <-result:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(time.Second):
+				t.Fatal("cancellation did not interrupt silent-peer handshake")
+			}
+		})
+	}
+}
+
+func TestHandshakeDeadline(t *testing.T) {
+	client, server := handshakePair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	result := startHandshake(t, client, ctx)
+	_, err := server.Receive()
+	require.NoError(t, err)
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			var timeout net.Error
+			require.ErrorAs(t, err, &timeout)
+			require.True(t, timeout.Timeout())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deadline did not interrupt silent-peer handshake")
+	}
+}
+
+func TestHandshakeSuccessDetachesCancellation(t *testing.T) {
+	client, server := handshakePair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := startHandshake(t, client, ctx)
+	_, err := server.Receive()
+	require.NoError(t, err)
+	require.NoError(t, server.Send("ACKF", DefaultClientACK))
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("normal handshake did not complete")
+	}
+	<-ctx.Done()
+	require.NoError(t, server.Send("MSGF", &Message{Data: []byte{1, 2, 3}}))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
+	message, err := client.Receive()
+	require.NoError(t, err, "completed handshake context must not close the connection or leave its old deadline")
+	require.Equal(t, []byte{1, 2, 3}, message[hdrlen:])
+}
+
+func TestHandshakeAlreadyCanceled(t *testing.T) {
+	client, _ := handshakePair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, client.Handshake(ctx, "opc.tcp://localhost:4840"), context.Canceled)
+}
+
 func TestConn(t *testing.T) {
 	t.Run("server exists ", func(t *testing.T) {
 		ep := "opc.tcp://127.0.0.1:4840/foo/bar"
