@@ -183,12 +183,15 @@ func (b *Buffer) ReadTime() time.Time {
 	if b.err != nil {
 		return time.Time{}
 	}
-	ts := binary.LittleEndian.Uint64(d)
+	ts := int64(binary.LittleEndian.Uint64(d))
 	if ts == 0 {
 		return time.Time{}
 	}
+	if ts == math.MaxInt64 {
+		return time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	}
 	// decode time in "100 nanosecond intervals since January 1, 1601" manner.
-	return time.Unix(0, int64((ts-116444736000000000)*100)).UTC()
+	return time.Unix(ts/10000000-11644473600, ts%10000000*100).UTC()
 }
 
 func (b *Buffer) ReadN(n int) []byte {
@@ -310,10 +313,14 @@ func (b *Buffer) WriteStruct(w interface{}) {
 
 func (b *Buffer) WriteTime(v time.Time) {
 	d := make([]byte, 8)
-	if !v.IsZero() {
+	switch {
+	case !v.After(time.Date(1601, 1, 1, 0, 0, 0, 0, time.UTC)):
+	case !v.Before(time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)):
+		binary.LittleEndian.PutUint64(d, math.MaxInt64)
+	default:
 		// encode time in "100 nanosecond intervals since January 1, 1601"
-		ts := uint64(v.UTC().UnixNano()/100 + 116444736000000000)
-		binary.LittleEndian.PutUint64(d, ts)
+		ts := (v.Unix()+11644473600)*10000000 + int64(v.Nanosecond())/100
+		binary.LittleEndian.PutUint64(d, uint64(ts))
 	}
 	b.Write(d)
 }

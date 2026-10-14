@@ -5,4 +5,7 @@
 // Package ua defines the structures, decoders and encoder
 // for built-in data types described in Part 6 Section 5 Data encoding
 // and for services in OPC UA Binary Protocol.
+// DateTime codecs preserve signed 100-nanosecond ticks beyond the Unix
+// nanosecond range. Encoding follows Part 6's zero/Int64-max boundary rules;
+// decoding preserves the invalid minimum/maximum DateTime sentinels.
 package ua

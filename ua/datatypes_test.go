@@ -5,9 +5,69 @@
 package ua
 
 import (
+	"encoding/binary"
+	"math"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
+
+func TestBufferDateTimeWideCalendar(t *testing.T) {
+	for _, stamp := range []time.Time{
+		time.Date(1600, 12, 31, 23, 59, 59, 123456700, time.UTC),
+		time.Date(1601, 1, 1, 0, 1, 49, 0, time.UTC),
+		time.Date(1677, 1, 2, 3, 4, 5, 987654300, time.UTC),
+		time.Date(1970, 1, 1, 0, 0, 0, 123456700, time.UTC),
+		time.Date(2026, 10, 14, 0, 0, 0, 123456700, time.UTC),
+		time.Date(2263, 1, 1, 0, 0, 0, 123456700, time.UTC),
+		time.Date(9999, 12, 31, 23, 59, 59, 999999900, time.UTC),
+	} {
+		t.Run(stamp.Format(time.RFC3339Nano), func(t *testing.T) {
+			ticks := (stamp.Unix()+11644473600)*10000000 + int64(stamp.Nanosecond())/100
+			wire := binary.LittleEndian.AppendUint64(nil, uint64(ticks))
+			require.Equal(t, stamp, NewBuffer(wire).ReadTime())
+			buffer := NewBuffer(nil)
+			buffer.WriteTime(stamp)
+			require.NoError(t, buffer.Error())
+			if !stamp.After(time.Date(1601, 1, 1, 0, 0, 0, 0, time.UTC)) {
+				wire = make([]byte, 8)
+			} else if !stamp.Before(time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)) {
+				wire = binary.LittleEndian.AppendUint64(nil, math.MaxInt64)
+			}
+			require.Equal(t, wire, buffer.Bytes())
+		})
+	}
+	require.True(t, NewBuffer(make([]byte, 8)).ReadTime().IsZero())
+	buffer := NewBuffer(nil)
+	buffer.WriteTime(time.Time{})
+	require.Equal(t, make([]byte, 8), buffer.Bytes())
+	require.Equal(t, time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC), NewBuffer(binary.LittleEndian.AppendUint64(nil, math.MaxInt64)).ReadTime())
+	stamp := time.Date(2263, 1, 1, 0, 0, 0, 123456789, time.UTC)
+	fractional := NewBuffer(nil)
+	fractional.WriteTime(stamp)
+	require.Equal(t, stamp.Truncate(100*time.Nanosecond), NewBuffer(fractional.Bytes()).ReadTime())
+}
+
+func TestDataValueTimestampPresenceAndPrecisionAreNotDurationFlags(t *testing.T) {
+	server := time.Date(2026, 10, 14, 12, 0, 0, 123456700, time.UTC)
+	ticks := (server.Unix()+11644473600)*10000000 + int64(server.Nanosecond())/100
+	wire := []byte{0x3d, 0x0a}
+	wire = binary.LittleEndian.AppendUint32(wire, math.Float32bits(70.5))
+	wire = binary.LittleEndian.AppendUint64(wire, 109*10000000)
+	wire = binary.LittleEndian.AppendUint16(wire, 1234)
+	wire = binary.LittleEndian.AppendUint64(wire, uint64(ticks))
+	wire = binary.LittleEndian.AppendUint16(wire, 5678)
+	var value DataValue
+	n, err := value.Decode(wire)
+	require.NoError(t, err)
+	require.Equal(t, len(wire), n)
+	require.Equal(t, float32(70.5), value.Value.Value())
+	require.Equal(t, time.Date(1601, 1, 1, 0, 1, 49, 0, time.UTC), value.SourceTimestamp)
+	require.Equal(t, server, value.ServerTimestamp)
+	require.Equal(t, uint16(1234), value.SourcePicoseconds)
+	require.Equal(t, uint16(5678), value.ServerPicoseconds)
+}
 
 func TestDataValue(t *testing.T) {
 	cases := []CodecTestCase{
