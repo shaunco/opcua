@@ -2,6 +2,7 @@ package opcua
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,48 @@ import (
 //     subscription_test.go:75: src 19942775
 // PASS
 // ok  	github.com/gopcua/opcua	116.192s
+
+func TestSubscriptionIdentityDuringRecreate(t *testing.T) {
+	var nextID uint32 = 1
+	stub := &stubClient{send: func(req ua.Request, h func(ua.Response) error) error {
+		if _, ok := req.(*ua.CreateSubscriptionRequest); !ok {
+			return ua.StatusBadServiceUnsupported
+		}
+		nextID++
+		return h(&ua.CreateSubscriptionResponse{
+			ResponseHeader: &ua.ResponseHeader{}, SubscriptionID: nextID,
+			RevisedPublishingInterval: float64(nextID), RevisedMaxKeepAliveCount: nextID,
+		})
+	}}
+	sub := newSubscriptionWithItems(stub)
+	ctx, cancel := context.WithCancel(context.Background())
+	done, started := make(chan struct{}), make(chan struct{})
+	var reads atomic.Uint64
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				sub.ID()
+				sub.publishTimeout()
+				if reads.Add(1) == 1 {
+					close(started)
+				}
+			}
+		}
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	<-started
+	for range 1000 {
+		require.NoError(t, sub.recreate_create(ctx))
+	}
+	cancel()
+	<-done
+	require.Positive(t, reads.Load())
+	require.Equal(t, uint32(1001), sub.ID())
+}
 
 func BenchmarkUnmonitorItems(b *testing.B) {
 	b.Run("slice", func(b *testing.B) {

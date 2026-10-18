@@ -225,8 +225,9 @@ func (s *Subscription) pump(ctx context.Context, notifyCh chan<- *DataChangeMess
 				continue
 			}
 
-			if msg.SubscriptionID != s.sub.SubscriptionID {
-				s.sendError(errors.Errorf("message sub id %v does not match sub id %v", msg.SubscriptionID, s.sub.SubscriptionID))
+			subscriptionID := s.sub.ID()
+			if msg.SubscriptionID != subscriptionID {
+				s.sendError(errors.Errorf("message sub id %v does not match sub id %v", msg.SubscriptionID, subscriptionID))
 				continue
 			}
 
@@ -302,7 +303,7 @@ func (s *Subscription) Subscribed() int {
 
 // SubscriptionID returns the underlying subscription id
 func (s *Subscription) SubscriptionID() uint32 {
-	return s.sub.SubscriptionID
+	return s.sub.ID()
 }
 
 // Delivered returns the number of DataChangeMessages delivered

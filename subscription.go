@@ -24,6 +24,7 @@ const (
 )
 
 type Subscription struct {
+	// SubscriptionID is retained for compatibility. Use ID for concurrent access.
 	SubscriptionID            uint32
 	RevisedPublishingInterval time.Duration
 	RevisedLifetimeCount      uint32
@@ -79,18 +80,26 @@ type PublishNotificationData struct {
 	Value          interface{}
 }
 
+// ID returns the current server-assigned subscription ID. It may change when
+// automatic reconnect recreates the subscription.
+func (s *Subscription) ID() uint32 {
+	s.paramsMu.Lock()
+	defer s.paramsMu.Unlock()
+	return s.SubscriptionID
+}
+
 // Cancel stops the subscription and removes it
 // from the client and the server.
 func (s *Subscription) Cancel(ctx context.Context) error {
 	stats.Subscription().Add("Cancel", 1)
-	s.c.ForgetSubscription(ctx, s.SubscriptionID)
+	s.c.ForgetSubscription(ctx, s.ID())
 	return s.delete(ctx)
 }
 
 // delete removes the subscription from the server.
 func (s *Subscription) delete(ctx context.Context) error {
 	req := &ua.DeleteSubscriptionsRequest{
-		SubscriptionIDs: []uint32{s.SubscriptionID},
+		SubscriptionIDs: []uint32{s.ID()},
 	}
 
 	var res *ua.DeleteSubscriptionsResponse
@@ -116,7 +125,7 @@ func (s *Subscription) ModifySubscription(ctx context.Context, params Subscripti
 
 	params.setDefaults()
 	req := &ua.ModifySubscriptionRequest{
-		SubscriptionID:              s.SubscriptionID,
+		SubscriptionID:              s.ID(),
 		RequestedPublishingInterval: float64(params.Interval.Milliseconds()),
 		RequestedLifetimeCount:      params.LifetimeCount,
 		RequestedMaxKeepAliveCount:  params.MaxKeepAliveCount,
@@ -136,11 +145,11 @@ func (s *Subscription) ModifySubscription(ctx context.Context, params Subscripti
 	// update subscription parameters
 	s.paramsMu.Lock()
 	s.params = &params
-	s.paramsMu.Unlock()
 	// update revised subscription parameters
 	s.RevisedPublishingInterval = time.Duration(res.RevisedPublishingInterval) * time.Millisecond
 	s.RevisedLifetimeCount = res.RevisedLifetimeCount
 	s.RevisedMaxKeepAliveCount = res.RevisedMaxKeepAliveCount
+	s.paramsMu.Unlock()
 
 	return res, nil
 }
@@ -152,7 +161,7 @@ func (s *Subscription) Monitor(ctx context.Context, ts ua.TimestampsToReturn, it
 
 	// Part 4, 5.13.2.2 CreateMonitoredItems Service Parameters
 	req := &ua.CreateMonitoredItemsRequest{
-		SubscriptionID:     s.SubscriptionID,
+		SubscriptionID:     s.ID(),
 		TimestampsToReturn: ts,
 		ItemsToCreate:      items,
 	}
@@ -217,7 +226,7 @@ func (s *Subscription) Unmonitor(ctx context.Context, monitoredItemIDs ...uint32
 
 	req := &ua.DeleteMonitoredItemsRequest{
 		MonitoredItemIDs: monitoredItemIDs,
-		SubscriptionID:   s.SubscriptionID,
+		SubscriptionID:   s.ID(),
 	}
 
 	var res *ua.DeleteMonitoredItemsResponse
@@ -247,7 +256,7 @@ func (s *Subscription) ModifyMonitoredItems(ctx context.Context, ts ua.Timestamp
 	for _, item := range items {
 		id := item.MonitoredItemID
 		if _, exists := s.items[id]; !exists {
-			err = fmt.Errorf("sub %d: cannot modify unknown monitored item id: %d", s.SubscriptionID, id)
+			err = fmt.Errorf("sub %d: cannot modify unknown monitored item id: %d", s.ID(), id)
 			break
 		}
 	}
@@ -258,7 +267,7 @@ func (s *Subscription) ModifyMonitoredItems(ctx context.Context, ts ua.Timestamp
 	}
 
 	req := &ua.ModifyMonitoredItemsRequest{
-		SubscriptionID:     s.SubscriptionID,
+		SubscriptionID:     s.ID(),
 		TimestampsToReturn: ts,
 		ItemsToModify:      items,
 	}
@@ -301,7 +310,7 @@ func (s *Subscription) SetMonitoringMode(ctx context.Context, monitoringMode ua.
 	s.itemsMu.Lock()
 	for _, id := range monitoredItemIDs {
 		if _, exists := s.items[id]; !exists {
-			err = fmt.Errorf("sub %d: cannot set monitoring mode for unknown monitored item id: %d", s.SubscriptionID, id)
+			err = fmt.Errorf("sub %d: cannot set monitoring mode for unknown monitored item id: %d", s.ID(), id)
 			break
 		}
 	}
@@ -312,7 +321,7 @@ func (s *Subscription) SetMonitoringMode(ctx context.Context, monitoringMode ua.
 	}
 
 	req := &ua.SetMonitoringModeRequest{
-		SubscriptionID:   s.SubscriptionID,
+		SubscriptionID:   s.ID(),
 		MonitoringMode:   monitoringMode,
 		MonitoredItemIDs: monitoredItemIDs,
 	}
@@ -335,7 +344,7 @@ func (s *Subscription) SetTriggering(ctx context.Context, triggeringItemID uint3
 
 	// Part 4, 5.13.5.2 SetTriggering Service Parameters
 	req := &ua.SetTriggeringRequest{
-		SubscriptionID:   s.SubscriptionID,
+		SubscriptionID:   s.ID(),
 		TriggeringItemID: triggeringItemID,
 		LinksToAdd:       add,
 		LinksToRemove:    remove,
@@ -349,7 +358,9 @@ func (s *Subscription) SetTriggering(ctx context.Context, triggeringItemID uint3
 }
 
 func (s *Subscription) publishTimeout() time.Duration {
+	s.paramsMu.Lock()
 	timeout := time.Duration(s.RevisedMaxKeepAliveCount) * s.RevisedPublishingInterval // expected keepalive interval
+	s.paramsMu.Unlock()
 	if timeout > uasc.MaxTimeout {
 		return uasc.MaxTimeout
 	}
@@ -369,6 +380,7 @@ func (s *Subscription) notify(ctx context.Context, data *PublishNotificationData
 
 // Stats returns a diagnostic struct with metadata about the current subscription
 func (s *Subscription) Stats(ctx context.Context) (*ua.SubscriptionDiagnosticsDataType, error) {
+	subscriptionID := s.ID()
 	// TODO(kung-foo): once browsing feature is merged, attempt to get direct access to the
 	// diagnostics node. for example, Prosys lists them like:
 	// i=2290/ns=1;g=918ee6f4-2d25-4506-980d-e659441c166d
@@ -380,12 +392,12 @@ func (s *Subscription) Stats(ctx context.Context) (*ua.SubscriptionDiagnosticsDa
 	}
 
 	if v == nil {
-		return nil, errors.Errorf("empty SubscriptionDiagnostics for sub=%d", s.SubscriptionID)
+		return nil, errors.Errorf("empty SubscriptionDiagnostics for sub=%d", subscriptionID)
 	}
 
 	eos, ok := v.Value().([]*ua.ExtensionObject)
 	if !ok {
-		return nil, errors.Errorf("invalid type for SubscriptionDiagnosticsArray. Want []*ua.ExtensionObject. subID=%d nodeID=%s type=%T", s.SubscriptionID, node.String(), v.Value())
+		return nil, errors.Errorf("invalid type for SubscriptionDiagnosticsArray. Want []*ua.ExtensionObject. subID=%d nodeID=%s type=%T", subscriptionID, node.String(), v.Value())
 	}
 
 	for _, eo := range eos {
@@ -394,12 +406,12 @@ func (s *Subscription) Stats(ctx context.Context) (*ua.SubscriptionDiagnosticsDa
 			continue
 		}
 
-		if stat.SubscriptionID == s.SubscriptionID {
+		if stat.SubscriptionID == subscriptionID {
 			return stat, nil
 		}
 	}
 
-	return nil, errors.Errorf("unable to find SubscriptionDiagnostics for sub=%d", s.SubscriptionID)
+	return nil, errors.Errorf("unable to find SubscriptionDiagnostics for sub=%d", subscriptionID)
 }
 
 func (p *SubscriptionParameters) setDefaults() {
@@ -427,9 +439,9 @@ func (p *SubscriptionParameters) setDefaults() {
 // recreate an existing subscription. This function deletes the
 // existing subscription from the server.
 func (s *Subscription) recreate_delete(ctx context.Context) error {
-	dlog := debug.NewPrefixLogger("sub %d: recreate_delete: ", s.SubscriptionID)
+	dlog := debug.NewPrefixLogger("sub %d: recreate_delete: ", s.ID())
 	req := &ua.DeleteSubscriptionsRequest{
-		SubscriptionIDs: []uint32{s.SubscriptionID},
+		SubscriptionIDs: []uint32{s.ID()},
 	}
 	var res *ua.DeleteSubscriptionsResponse
 	_ = s.c.Send(ctx, req, func(v ua.Response) error {
@@ -444,7 +456,7 @@ func (s *Subscription) recreate_delete(ctx context.Context) error {
 // new subscription with the same parameters as the previous one.
 // The client registers the recreated subscription immediately afterwards.
 func (s *Subscription) recreate_create(ctx context.Context) error {
-	dlog := debug.NewPrefixLogger("sub %d: recreate_create: ", s.SubscriptionID)
+	dlog := debug.NewPrefixLogger("sub %d: recreate_create: ", s.ID())
 
 	s.paramsMu.Lock()
 	params := s.params
@@ -473,10 +485,12 @@ func (s *Subscription) recreate_create(ctx context.Context) error {
 	dlog.Printf("recreated as subscription %d", res.SubscriptionID)
 	dlog.SetPrefix(fmt.Sprintf("sub %d: recreate: ", res.SubscriptionID))
 
+	s.paramsMu.Lock()
 	s.SubscriptionID = res.SubscriptionID
 	s.RevisedPublishingInterval = time.Duration(res.RevisedPublishingInterval) * time.Millisecond
 	s.RevisedLifetimeCount = res.RevisedLifetimeCount
 	s.RevisedMaxKeepAliveCount = res.RevisedMaxKeepAliveCount
+	s.paramsMu.Unlock()
 	s.lastSeq = 0
 	s.nextSeq = 1
 
@@ -492,7 +506,7 @@ func (s *Subscription) recreate_create(ctx context.Context) error {
 // gone, does not fail the restore. It is dropped and logged and the remaining
 // items are restored.
 func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
-	dlog := debug.NewPrefixLogger("sub %d: recreate_monitoredItems: ", s.SubscriptionID)
+	dlog := debug.NewPrefixLogger("sub %d: recreate_monitoredItems: ", s.ID())
 
 	// Sort by timestamp to return
 	itemsByTimestamps := make(map[ua.TimestampsToReturn][]*ua.MonitoredItemCreateRequest)
@@ -509,7 +523,7 @@ func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
 
 	for ts, items := range itemsByTimestamps {
 		req := &ua.CreateMonitoredItemsRequest{
-			SubscriptionID:     s.SubscriptionID,
+			SubscriptionID:     s.ID(),
 			TimestampsToReturn: ts,
 			ItemsToCreate:      items,
 		}
@@ -526,7 +540,7 @@ func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
 		// Part 4, 5.13.2.2: the size and order of the results match the size
 		// and order of itemsToCreate.
 		if len(res.Results) != len(items) {
-			return errors.Errorf("sub %d: got %d results for %d monitored items", s.SubscriptionID, len(res.Results), len(items))
+			return errors.Errorf("sub %d: got %d results for %d monitored items", s.ID(), len(res.Results), len(items))
 		}
 
 		for i, item := range items {
@@ -535,7 +549,7 @@ func (s *Subscription) recreate_monitoredItems(ctx context.Context) error {
 				// not dlog: losing a monitored item across a reconnect is
 				// data the caller stops receiving, so it has to be visible
 				// without debug logging turned on.
-				log.Printf("sub %d: dropping monitored item %s on recreate: %v", s.SubscriptionID, monitoredNodeID(item), status)
+				log.Printf("sub %d: dropping monitored item %s on recreate: %v", s.ID(), monitoredNodeID(item), status)
 				continue
 			}
 			restored[result.MonitoredItemID] = &monitoredItem{
